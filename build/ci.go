@@ -18,19 +18,14 @@
 
 /*
 The ci command is called from Continuous Integration scripts.
-
 Usage: go run build/ci.go <command> <command flags/arguments>
-
 Available commands are:
-
    install    [ -arch architecture ] [ -cc compiler ] [ packages... ]                          -- builds packages and executables
    test       [ -coverage ] [ packages... ]                                                    -- runs the tests
    lint                                                                                        -- runs certain pre-selected linters
    importkeys                                                                                  -- imports signing keys from env
    xgo        [ -alltools ] [ options ]                                                        -- cross builds according to options
-
 For all commands, -n prevents execution of external programs (dry run mode).
-
 */
 package main
 
@@ -60,11 +55,11 @@ var (
 		executablePath("geth"),
 		executablePath("puppeth"),
 		executablePath("rlpdump"),
+		executablePath("swarm"),
 		executablePath("wnode"),
 	}
 
-	// Packages to be cross-compiled by the xgo command
-	allCrossCompiledArchiveFiles = allToolsArchiveFiles
+	dlgoVersion = "1.16.4"
 )
 
 var GOBIN, _ = filepath.Abs(filepath.Join("build", "bin"))
@@ -214,64 +209,75 @@ func goToolArch(arch string, cc string, subcmd string, args ...string) *exec.Cmd
 // Running The Tests
 //
 // "tests" also includes static analysis tools such as vet.
-
 func doTest(cmdline []string) {
-	coverage := flag.Bool("coverage", false, "Whether to record code coverage")
+	var (
+		dlgo     = flag.Bool("dlgo", false, "Download Go and build with it")
+		arch     = flag.String("arch", "", "Run tests for given architecture")
+		cc       = flag.String("cc", "", "Sets C compiler binary")
+		coverage = flag.Bool("coverage", false, "Whether to record code coverage")
+		verbose  = flag.Bool("v", false, "Whether to log verbosely")
+	)
 	flag.CommandLine.Parse(cmdline)
-	env := build.Env()
+	fmt.Printf("Running tests with command line %v \n", cmdline)
+	// Configure the toolchain.
+	tc := build.GoToolchain{GOARCH: *arch, CC: *cc}
+	if *dlgo {
+		csdb := build.MustLoadChecksums("build/checksums.txt")
+		tc.Root = build.DownloadGo(csdb, dlgoVersion)
+	}
+	gotest := tc.Go("test")
+
+	// Test a single package at a time. CI builders are slow
+	// and some tests run into timeouts under load.
+	gotest.Args = append(gotest.Args, "-p", "1")
+	if *coverage {
+		gotest.Args = append(gotest.Args, "-covermode=atomic", "-cover")
+	}
+	if *verbose {
+		gotest.Args = append(gotest.Args, "-v")
+	}
 
 	packages := []string{"./..."}
 	if len(flag.CommandLine.Args()) > 0 {
 		packages = flag.CommandLine.Args()
 	}
-	packages = build.ExpandPackagesNoVendor(packages)
-
-	// Run the actual tests.
-	// Test a single package at a time. CI builders are slow
-	// and some tests run into timeouts under load.
-	gotest := goTool("test", buildFlags(env)...)
-	gotest.Args = append(gotest.Args, "-p", "1", "-timeout", "5m")
-	if *coverage {
-		gotest.Args = append(gotest.Args, "-covermode=atomic", "-cover")
-	}
-
+	fmt.Printf("Running tests for %v \n", packages)
 	gotest.Args = append(gotest.Args, packages...)
 	build.MustRun(gotest)
 }
 
-// runs gometalinter on requested packages
+// doLint runs golangci-lint on requested packages.
 func doLint(cmdline []string) {
+	var (
+		cachedir = flag.String("cachedir", "./build/cache", "directory for caching golangci-lint binary.")
+	)
 	flag.CommandLine.Parse(cmdline)
-
 	packages := []string{"./..."}
 	if len(flag.CommandLine.Args()) > 0 {
 		packages = flag.CommandLine.Args()
 	}
-	// Get metalinter and install all supported linters
-	build.MustRun(goTool("get", "gopkg.in/alecthomas/gometalinter.v2"))
-	build.MustRunCommand(filepath.Join(GOBIN, "gometalinter.v2"), "--install")
 
-	// Run fast linters batched together
-	configs := []string{
-		"--vendor",
-		"--tests",
-		"--deadline=2m",
-		"--disable-all",
-		"--enable=goimports",
-		"--enable=varcheck",
-		"--enable=vet",
-		"--enable=gofmt",
-		"--enable=misspell",
-		"--enable=goconst",
-		"--min-occurrences=6", // for goconst
-	}
-	build.MustRunCommand(filepath.Join(GOBIN, "gometalinter.v2"), append(configs, packages...)...)
+	linter := downloadLinter(*cachedir)
+	lflags := []string{"run", "--config", ".golangci.yml"}
+	build.MustRunCommand(linter, append(lflags, packages...)...)
+	fmt.Println("You have achieved perfection.")
+}
 
-	// Run slow linters one by one
-	for _, linter := range []string{"unconvert", "gosimple"} {
-		configs = []string{"--vendor", "--tests", "--deadline=10m", "--disable-all", "--enable=" + linter}
-		build.MustRunCommand(filepath.Join(GOBIN, "gometalinter.v2"), append(configs, packages...)...)
+// downloadLinter downloads and unpacks golangci-lint.
+func downloadLinter(cachedir string) string {
+	const version = "1.39.0"
+
+	csdb := build.MustLoadChecksums("build/checksums.txt")
+	base := fmt.Sprintf("golangci-lint-%s-%s-%s", version, runtime.GOOS, runtime.GOARCH)
+	url := fmt.Sprintf("https://github.com/golangci/golangci-lint/releases/download/v%s/%s.tar.gz", version, base)
+	archivePath := filepath.Join(cachedir, base+".tar.gz")
+	if err := csdb.DownloadFile(url, archivePath); err != nil {
+		log.Fatal(err)
 	}
+	if err := build.ExtractArchive(archivePath, cachedir); err != nil {
+		log.Fatal(err)
+	}
+	return filepath.Join(cachedir, base, "golangci-lint")
 }
 
 // Cross compilation
@@ -292,7 +298,7 @@ func doXgo(cmdline []string) {
 
 	if *alltools {
 		args = append(args, []string{"--dest", GOBIN}...)
-		for _, res := range allCrossCompiledArchiveFiles {
+		for _, res := range allToolsArchiveFiles {
 			if strings.HasPrefix(res, GOBIN) {
 				// Binary tool found, cross build it explicitly
 				args = append(args, "./"+filepath.Join("cmd", filepath.Base(res)))
