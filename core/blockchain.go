@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/XinFinOrg/XDPoSChain/XDCxlending/lendingstate"
+	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
+	lru "github.com/hashicorp/golang-lru"
 
 	"github.com/XinFinOrg/XDPoSChain/XDCx/tradingstate"
 	"github.com/XinFinOrg/XDPoSChain/accounts/abi/bind"
@@ -36,7 +38,7 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/common"
 	"github.com/XinFinOrg/XDPoSChain/common/mclock"
 	"github.com/XinFinOrg/XDPoSChain/consensus"
-	"github.com/XinFinOrg/XDPoSChain/consensus/XDPoS"
+
 	contractValidator "github.com/XinFinOrg/XDPoSChain/contracts/validator/contract"
 	"github.com/XinFinOrg/XDPoSChain/core/state"
 	"github.com/XinFinOrg/XDPoSChain/core/types"
@@ -50,7 +52,6 @@ import (
 	"github.com/XinFinOrg/XDPoSChain/params"
 	"github.com/XinFinOrg/XDPoSChain/rlp"
 	"github.com/XinFinOrg/XDPoSChain/trie"
-	lru "github.com/hashicorp/golang-lru"
 	"gopkg.in/karalabe/cookiejar.v2/collections/prque"
 )
 
@@ -152,10 +153,10 @@ type BlockChain struct {
 	validator Validator // block and state validator interface
 	vmConfig  vm.Config
 
-	badBlocks      *lru.Cache              // Bad block cache
-	shouldPreserve func(*types.Block) bool // Function used to determine whether should preserve the given block.
-	IPCEndpoint    string
-	Client         bind.ContractBackend // Global ipc client instance.
+	badBlocks   *lru.Cache // Bad block cache
+	IPCEndpoint string
+	Client      *ethclient.Client // Global ipc client instance.
+
 	// Blocks hash array by block number
 	// cache field for tracking finality purpose, can't use for tracking block vs block relationship
 	blocksHashCache *lru.Cache
@@ -1362,13 +1363,6 @@ func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.
 	// Set new head.
 	if status == CanonStatTy {
 		bc.insert(block)
-		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
-			err := bc.UpdateM1()
-			if err != nil {
-				log.Crit("Error when update masternodes set. Stopping node", "err", err)
-			}
-		}
 	}
 	// save cache BlockSigners
 	if bc.chainConfig.XDPoS != nil && bc.chainConfig.IsTIPSigning(block.Number()) {
@@ -1701,6 +1695,13 @@ func (bc *BlockChain) insertChain(chain types.Blocks) (int, []interface{}, []*ty
 			if (chain[i].NumberU64() % bc.chainConfig.XDPoS.Epoch) == 0 {
 				CheckpointCh <- 1
 
+			}
+			// prepare set of masternodes for the next epoch
+			if (chain[i].NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap) {
+				err := bc.UpdateM1()
+				if err != nil {
+					log.Crit("Error when update masternodes set. Stopping node", "err", err)
+				}
 			}
 		}
 	}
@@ -2039,6 +2040,14 @@ func (bc *BlockChain) insertBlock(block *types.Block) ([]interface{}, []*types.L
 			CheckpointCh <- 1
 
 		}
+		// prepare set of masternodes for the next epoch
+		if (block.NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap) {
+			err := bc.UpdateM1()
+			if err != nil {
+				log.Error("Error when update masternodes set. Stopping node", "err", err)
+				os.Exit(1)
+			}
+		}
 	}
 	// Append a single chain head event if we've progressed the chain
 	if status == CanonStatTy && bc.CurrentBlock().Hash() == block.Hash() {
@@ -2185,13 +2194,6 @@ func (bc *BlockChain) reorg(oldBlock, newBlock *types.Block) error {
 			return err
 		}
 		addedTxs = append(addedTxs, newChain[i].Transactions()...)
-		// prepare set of masternodes for the next epoch
-		if bc.chainConfig.XDPoS != nil && ((newChain[i].NumberU64() % bc.chainConfig.XDPoS.Epoch) == (bc.chainConfig.XDPoS.Epoch - bc.chainConfig.XDPoS.Gap)) {
-			err := bc.UpdateM1()
-			if err != nil {
-				log.Crit("Error when update masternodes set. Stopping node", "err", err)
-			}
-		}
 	}
 	// calculate the difference between deleted and added transactions
 	diff := types.TxDifference(deletedTxs, addedTxs)
@@ -2427,7 +2429,7 @@ func (bc *BlockChain) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscript
 }
 
 // Get current IPC Client.
-func (bc *BlockChain) GetClient() (bind.ContractBackend, error) {
+func (bc *BlockChain) GetClient() (*ethclient.Client, error) {
 	if bc.Client == nil {
 		// Inject ipc client global instance.
 		client, err := ethclient.Dial(bc.IPCEndpoint)
